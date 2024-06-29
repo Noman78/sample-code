@@ -1,0 +1,171 @@
+Route:
+Route::resource('sales', SaleController::class);
+
+Controller (Store Function)
+
+public function store(Request $request)
+    {
+        $data = $request->except('document');
+        $data['user_id'] = Auth::id();
+        $cash_register_data = CashRegister::where([
+            ['user_id', $data['user_id']],
+            ['status', true]
+        ])->first();
+
+        if(!isset($data['change'])){
+            $data['change'] = 0.0;
+        }
+
+        if($cash_register_data) {
+            $data['cash_register_id'] = $cash_register_data->id;
+        } else {
+            $data['cash_register_id'] = 1;
+        }
+        $data['reference_no'] = 'sr-' . date("Ymd") . '-'. date("his");
+        $document = $request->document;
+        if($document) {
+            $v = Validator::make(
+                [
+                    'extension' => strtolower($request->document->getClientOriginalExtension()),
+                ],
+                [
+                    'extension' => 'in:jpg,jpeg,png,gif,pdf,csv,docx,xlsx,txt',
+                ]
+            );
+
+            if ($v->fails()){
+                return redirect()->back()->withErrors($v->errors());
+            }
+
+            $path = public_path('documents/sales/');
+            if(!\File::isDirectory($path)){
+                \File::makeDirectory($path, 0777, true, true);
+            }
+            $documentName = $document->getClientOriginalName();
+            $document->move($path, $documentName);
+            $data['document'] = $documentName;
+        }
+        
+        $data['paid_amount'] = $data['paying_amount'];
+        Sale::create($data);
+	// Sale Created
+
+	// Update Product Inventory
+        $sale_data = Sale::latest()->first();
+        $product_id = $data['product_id'];
+        $product_code = $data['product_code'];
+        $qty = $data['qty'];
+        $net_unit_cost = $data['net_unit_cost'];
+        $net_unit_price = $data['net_unit_price'];
+        $discount = $data['discount'];
+        $total = $data['subtotal'];
+        $product_sale = [];
+
+        foreach($product_id as $i => $id){
+            $product_data = Product::find($id);
+            $product_data->qty -= $qty[$i];
+            $product_data->save();
+            $purchase_id = ProductPurchase::where('product_id', $id)->first();
+            $purchase = Purchase::select('supplier_id')->where('id', $purchase_id->purchase_id)->first();
+            $get_ledger_data = CustomerSupplierLedger::where('customer_id', $sale_data->customer_id)->where('supplier_id', $purchase->supplier_id)->first();
+
+	// Update Supplier's Ledger Record (According to Current Sale)
+            if(!$get_ledger_data){
+                $ledger = new CustomerSupplierLedger();
+                $ledger->customer_id = $sale_data->customer_id;
+                $ledger->supplier_id = $purchase->supplier_id;
+                $ledger->grand_total = ($net_unit_cost[$i] * $data['qty'][$i]);
+                $ledger->last_payment = 0;
+                $ledger->save();
+            } else {
+                $get_ledger_data->grand_total = ($get_ledger_data->grand_total + ($net_unit_cost[$i] * $data['qty'][$i]));
+                $get_ledger_data->save();
+            }
+
+	// Update Product Qty
+            $inventory_data = Inventory::where('product_id', $id)->get();
+            foreach($inventory_data as $inventory){
+                if ($qty[$i] <= 0) {
+                    break; // No more quantity to subtract
+                }
+                
+                if($inventory->product_qty != 0){
+                    if ($inventory->product_qty >= $qty[$i]) {
+                        $qty_histroy = new SaleProductQtyHistory();
+                        $qty_histroy->sale_id = $sale_data->id;
+                        $qty_histroy->purchase_id = $inventory->purchase_id;
+                        $qty_histroy->product_id = $inventory->product_id;
+                        $qty_histroy->product_qty = $qty[$i];
+                        $qty_histroy->save();
+    
+                        $inventory->product_qty -= $qty[$i];
+                        $inventory->save();
+                        $qty[$i] = 0; // Subtraction complete
+                    } else {
+                        $qty[$i] -= $inventory->product_qty;
+    
+                        $qty_histroy = new SaleProductQtyHistory();
+                        $qty_histroy->sale_id = $sale_data->id;
+                        $qty_histroy->purchase_id = $inventory->purchase_id;
+                        $qty_histroy->product_id = $inventory->product_id;
+                        $qty_histroy->product_qty = $inventory->product_qty;
+                        $qty_histroy->save();
+                        
+                        $inventory->product_qty = 0;
+                        $inventory->save();
+                    }
+                }
+            }
+
+            $product_sale['sale_id'] = $sale_data->id;
+            $product_sale['product_id'] = $id;
+            $product_sale['qty'] = $data['qty'][$i];
+            $product_sale['net_unit_cost'] = $net_unit_cost[$i];
+            $product_sale['net_unit_price'] = $net_unit_price[$i];
+            $product_sale['discount'] = $discount[$i];
+            $product_sale['total'] = $total[$i];
+            ProductSale::create($product_sale);
+        }
+
+	// Add payment record if cusromer paid the inv
+        if($data['payment_status'] == 3 || $data['payment_status'] == 4 || ($data['payment_status'] == 2 && $data['paying_amount'] > 0)) {
+            
+            $payment = new Payment();
+            $all_of_amount_sales = Sale::where('customer_id', $sale_data->customer_id)->sum('grand_total');
+            $payment->user_id = Auth::id();
+
+            if($data['paid_by_id'] == 1){
+                $paying_method = 'Cash';
+            } elseif($data['paid_by_id'] == 2){
+                $paying_method = 'Cheque';
+            }
+
+            // if($cash_register_data)
+            if($data['cash_register_id'])
+                $payment->cash_register_id = $data['cash_register_id'];
+                if(!$data['account_id']){
+                    $account = Account::where('is_default', true)->first();
+                    $payment->account_id = $account->id;
+                } else {
+                    $payment->account_id = $data['account_id'];
+                }
+            $payment->sale_id = $sale_data->id;
+            $data['payment_reference'] = 'spr-'.date("Ymd").'-'.date("his");
+            $payment->payment_reference = $data['payment_reference'];
+            $payment->amount = $data['paying_amount'];
+            if($data['change'] < 0){
+                $payment->change = 0;
+            } else {
+                $payment->change = $data['change'];
+            }
+            $payment->paying_method = $paying_method;
+            $payment->payment_note = $data['payment_note'];
+            $payment->save();
+        }
+
+        if($sale_data->sale_status == '1'){
+            return redirect('sales/gen_invoice/' . $sale_data->id)->with('success', 'Sale Added Successfully!');
+        } else {
+            return redirect('sales')->with('success', 'Sale Added Successfully!');
+        }
+    }
